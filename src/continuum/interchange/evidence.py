@@ -25,9 +25,10 @@ Design constraints
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from continuum.events import Event
 from continuum.security.hashing import stable_hash, to_json
@@ -51,7 +52,13 @@ Kind = Literal["transition", "observation", "relation", "checkpoint"]
 
 
 class EvidencePrimitive(BaseModel):
-    """Base for all exported primitives."""
+    """Base for all exported primitives.
+
+    Every primitive is derived from exactly one log fact, so the event identity
+    the fact came from is carried on the base rather than repeated on each
+    subclass. A checkpoint record read straight from storage has no event of
+    its own and is stamped with the checkpoint id and ``STATE_CHECKPOINTED``.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -64,9 +71,16 @@ class EvidencePrimitive(BaseModel):
     timestamp: str
     payload: dict[str, Any]
     signature_inputs: dict[str, Any]
+    event_id: str
+    event_type: str
 
     def content(self) -> dict[str, Any]:
-        """Return the canonical fields represented by this primitive."""
+        """Return the canonical fields represented by this primitive.
+
+        Excludes ``content_hash`` (a hash cannot cover itself) and the event
+        identity, which ``signature_inputs`` already covers as part of the
+        event's own hashed content.
+        """
         return {
             "kind": self.kind,
             "run_id": self.run_id,
@@ -87,16 +101,12 @@ class Transition(EvidencePrimitive):
     """Represent an event-backed state transition."""
 
     kind: Literal["transition"] = "transition"
-    event_id: str
-    event_type: str
 
 
 class Observation(EvidencePrimitive):
     """Represent an environment or tool observation."""
 
     kind: Literal["observation"] = "observation"
-    event_id: str
-    event_type: str
     observed_at: str
 
 
@@ -104,10 +114,37 @@ class Relation(EvidencePrimitive):
     """Represent a dependency or derivation relation between items."""
 
     kind: Literal["relation"] = "relation"
-    event_id: str
-    event_type: str
     source_id: str | None = None
     target_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_endpoints(cls, data: Any) -> Any:
+        """Fill ``source_id``/``target_id`` from the payload when absent.
+
+        Dependency edges point at resources, decisions or findings, and the id
+        worth surfacing is whichever of those the event actually carried. This
+        is the one non-trivial step in building a relation, so it lives in the
+        model: a primitive reconstructed by a receiver from an exported line
+        derives the same endpoints the exporter produced, and the guess has a
+        single home to read and change.
+        """
+        if not isinstance(data, dict):
+            return data
+        payload = data.get("payload")
+        if not isinstance(payload, Mapping):
+            return data
+        if not data.get("source_id"):
+            source = (
+                payload.get("resource") or payload.get("decision_id") or payload.get("finding_id")
+            )
+            data["source_id"] = str(source) if source else None
+        if not data.get("target_id"):
+            target = payload.get("evidence") or payload.get("depends_on")
+            if isinstance(target, list) and target:
+                target = target[0]
+            data["target_id"] = str(target) if target else None
+        return data
 
 
 class Checkpoint(EvidencePrimitive):
@@ -175,28 +212,29 @@ def _classify(event: Event) -> Kind:
 # ---------------------------------------------------------------------------
 
 
-def export_evidence(storage: Storage, run_id: str) -> list[dict[str, Any]]:
-    """Export a run's evidence as JSON-serialisable primitives.
+def export_evidence(storage: Storage, run_id: str) -> list[EvidencePrimitive]:
+    """Export a run's evidence as typed, JSON-serialisable primitives.
 
     Reads ``events`` plus ``archived_events`` (so compacted runs are fully
     covered) and ``checkpoints``. Each primitive carries ``content_hash``
     (stable_hash of its content), ``prev_hash`` (previous primitive's hash
     for chain verification), ``origin`` and signature inputs.
 
+    The result is the module's own model types, so a missing or stray field in
+    the export is a construction error rather than silent dict-key drift::
+
+        for prim in export_evidence(storage, run_id):
+            print(prim.kind, prim.sequence, prim.content_hash[:12])
+
     The caller may write the result as JSON lines::
 
         for prim in export_evidence(storage, run_id):
-            print(json.dumps(prim, sort_keys=True))
+            print(json.dumps(prim.model_dump(mode="json"), sort_keys=True))
 
-    Truncation or tampering is detectable by the receiver::
+    Truncation or tampering is detectable by the receiver, either through the
+    typed result or through the dicts a parsed JSON line yields::
 
-        prev = None
-        for i, prim in enumerate(exported, start=1):
-            assert prim["sequence"] == i
-            assert prim["prev_hash"] == prev
-            assert prim["content_hash"] == stable_hash(prim["signature_inputs"])
-            # also recompute event digest for transitions/observations/relations
-            prev = prim["content_hash"]
+        ok = verify_export(exported)
 
     Pure read, no writes, zero new dependencies.
     """
@@ -213,7 +251,7 @@ def export_evidence(storage: Storage, run_id: str) -> list[dict[str, Any]]:
     # but useful for enrichment).
     _cp_by_id = {c.checkpoint_id: c for c in checkpoints}
 
-    primitives: list[dict[str, Any]] = []
+    primitives: list[EvidencePrimitive] = []
     prev_hash: str | None = None
     seq = 0
 
@@ -229,12 +267,9 @@ def export_evidence(storage: Storage, run_id: str) -> list[dict[str, Any]]:
         # lets a receiver recompute stable_hash(signature_inputs) after
         # loading the JSON lines.
         sig_inputs = json.loads(to_json(ev.content()))
-        # Content hash for the exported primitive is the event's own hash
-        # (so it matches verify() directly) and also stable_hash of the
-        # primitive's content for chain verification. We store both:
-        # content_hash is the export chain hash, event_hash is the raw event
-        # hash for direct compare.
-        primitive: dict[str, Any]
+        # Content hash for the exported primitive is the event's own hash,
+        # so it matches verify() directly and a receiver recompute is a
+        # single stable_hash(signature_inputs).
         base = {
             "run_id": ev.run_id,
             "sequence": seq,
@@ -247,40 +282,30 @@ def export_evidence(storage: Storage, run_id: str) -> list[dict[str, Any]]:
             "event_id": ev.event_id,
             "event_type": ev.type.value,
         }
+        primitive: EvidencePrimitive
         if kind == "transition":
-            primitive = {"kind": "transition", **base}
+            primitive = Transition(kind="transition", **base)
         elif kind == "observation":
-            primitive = {"kind": "observation", "observed_at": ev.timestamp.isoformat(), **base}
-        elif kind == "relation":
-            # Try to extract source/target ids for dependency edges.
-            source_id = (
-                ev.payload.get("resource")
-                or ev.payload.get("decision_id")
-                or ev.payload.get("finding_id")
+            primitive = Observation(
+                kind="observation", observed_at=ev.timestamp.isoformat(), **base
             )
-            target_id = ev.payload.get("evidence") or ev.payload.get("depends_on")
-            if isinstance(target_id, list) and target_id:
-                target_id = target_id[0]
-            primitive = {
-                "kind": "relation",
-                "source_id": str(source_id) if source_id else None,
-                "target_id": str(target_id) if target_id else None,
-                **base,
-            }
+        elif kind == "relation":
+            # source_id/target_id are derived by the model from the payload.
+            primitive = Relation(kind="relation", **base)
         else:  # checkpoint
             # Enrich with checkpoint record if available.
             cp = None
             cid = ev.payload.get("checkpoint_id")
             if isinstance(cid, str):
                 cp = _cp_by_id.get(cid)
-            primitive = {
-                "kind": "checkpoint",
-                "checkpoint_id": cid if isinstance(cid, str) else ev.event_id,
-                "version": ev.payload.get("version", 0),
-                "trigger": ev.payload.get("trigger", "unknown"),
-                "integrity_hash": cp.integrity_hash if cp else None,
+            primitive = Checkpoint(
+                kind="checkpoint",
+                checkpoint_id=cid if isinstance(cid, str) else ev.event_id,
+                version=ev.payload.get("version", 0),
+                trigger=ev.payload.get("trigger", "unknown"),
+                integrity_hash=cp.integrity_hash if cp else None,
                 **base,
-            }
+            )
         primitives.append(primitive)
         prev_hash = ev.hash
 
@@ -291,71 +316,102 @@ def export_evidence(storage: Storage, run_id: str) -> list[dict[str, Any]]:
     # event. This keeps the export covering every event exactly once for
     # the truncation check, while still surfacing the checkpoint's
     # integrity_hash for external verification.
-    emitted_cids = {p["checkpoint_id"] for p in primitives if p["kind"] == "checkpoint"}
+    emitted_cids = {p.checkpoint_id for p in primitives if isinstance(p, Checkpoint)}
     for cp in checkpoints:
         if cp.checkpoint_id in emitted_cids:
             continue
         seq += 1
         sig_inputs = json.loads(to_json(cp.content()))
-        primitive = {
-            "kind": "checkpoint",
-            "run_id": cp.run_id,
-            "sequence": seq,
-            "content_hash": cp.integrity_hash,
-            "prev_hash": prev_hash,
-            "origin": "deterministic",
-            "timestamp": cp.created_at.isoformat(),
-            "payload": {
+        primitive = Checkpoint(
+            kind="checkpoint",
+            run_id=cp.run_id,
+            sequence=seq,
+            content_hash=cp.integrity_hash,
+            prev_hash=prev_hash,
+            origin="deterministic",
+            timestamp=cp.created_at.isoformat(),
+            payload={
                 "checkpoint_id": cp.checkpoint_id,
                 "version": cp.version,
                 "trigger": cp.trigger,
             },
-            "signature_inputs": sig_inputs,
-            "checkpoint_id": cp.checkpoint_id,
-            "version": cp.version,
-            "trigger": cp.trigger,
-            "integrity_hash": cp.integrity_hash,
-            "event_id": cp.checkpoint_id,
-            "event_type": "STATE_CHECKPOINTED",
-        }
+            signature_inputs=sig_inputs,
+            checkpoint_id=cp.checkpoint_id,
+            version=cp.version,
+            trigger=cp.trigger,
+            integrity_hash=cp.integrity_hash,
+            event_id=cp.checkpoint_id,
+            event_type="STATE_CHECKPOINTED",
+        )
         primitives.append(primitive)
         prev_hash = cp.integrity_hash
 
     return primitives
 
 
-def verify_export(primitives: list[dict[str, Any]]) -> bool:
+_KIND_MODELS: dict[str, type[EvidencePrimitive]] = {
+    "transition": Transition,
+    "observation": Observation,
+    "relation": Relation,
+    "checkpoint": Checkpoint,
+}
+
+
+def _as_primitive(prim: EvidencePrimitive | Mapping[str, Any]) -> EvidencePrimitive | None:
+    """Return ``prim`` as a typed primitive, or ``None`` if it cannot be one.
+
+    A receiver holds plain dicts after parsing exported JSON lines; rebuilding
+    the matching model re-runs the ``extra="forbid"`` check so a line missing a
+    declared field, carrying a stray one, or drifting a type is rejected here
+    rather than passing as a well-formed chain.
+    """
+    if isinstance(prim, EvidencePrimitive):
+        return prim
+    if not isinstance(prim, Mapping):
+        return None
+    kind = prim.get("kind")
+    model = _KIND_MODELS.get(kind) if isinstance(kind, str) else None
+    if model is None:
+        return None
+    try:
+        return model(**prim)
+    except ValidationError:
+        return None
+
+
+def verify_export(primitives: list[EvidencePrimitive | dict[str, Any]]) -> bool:
     """Verify an exported stream exactly as a receiver would.
 
+    Accepts the typed primitives ``export_evidence`` returns, or the plain
+    dicts a receiver has after parsing the exported JSON lines; dict input is
+    rebuilt through its model first.
+
     Returns True if the chain is intact, sequences are contiguous starting at
-    1, each content_hash matches the recomputed digest of signature_inputs
-    (for events) or is present for checkpoints, and prev_hash links are
-    correct. Used in tests to prove truncation is detectable.
+    1, each content_hash matches the recomputed digest of signature_inputs,
+    and prev_hash links are correct. Used in tests to prove truncation is
+    detectable.
     """
     prev: str | None = None
     for i, prim in enumerate(primitives, start=1):
-        if prim.get("sequence") != i:
+        item = _as_primitive(prim)
+        if item is None:
             return False
-        if prim.get("prev_hash") != prev:
+        if item.sequence != i:
             return False
-        # Recompute event hash where possible.
-        sig = prim.get("signature_inputs")
+        if item.prev_hash != prev:
+            return False
+        # Recompute the hash the primitive was sealed with. For event-backed
+        # primitives signature_inputs is the event content, so this is the
+        # event's own hash; for a checkpoint read straight from storage it is
+        # the checkpoint content, whose digest is the integrity_hash the
+        # record was sealed with. Either way a mismatch means tampering.
+        sig = item.signature_inputs
         if sig is not None:
-            # For event-backed primitives, signature_inputs is the event content.
-            # Recompute and compare to content_hash.
             try:
                 recomputed = stable_hash(sig)
             except Exception:
                 return False
-            if prim.get("content_hash") != recomputed:
-                # For checkpoint primitives that were not event-backed, the
-                # content_hash is the checkpoint's integrity_hash, not the
-                # stable_hash of signature_inputs. In that case, we accept
-                # the stored hash as long as prev links hold; the checkpoint's
-                # own verify() would be used. We only enforce the event case
-                # where event_id is present and type is not checkpoint-only.
-                # To keep it simple, we require the hash to match the stored
-                # event hash which we already have; if it doesn't, it's tampered.
+            if item.content_hash != recomputed:
                 return False
-        prev = prim.get("content_hash")
+        prev = item.content_hash
     return True

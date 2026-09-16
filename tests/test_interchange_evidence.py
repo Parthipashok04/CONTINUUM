@@ -6,9 +6,20 @@ import hashlib
 import io
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from continuum.cli import ExitCode, main
 from continuum.events import EventType
-from continuum.interchange.evidence import export_evidence, verify_export
+from continuum.interchange.evidence import (
+    Checkpoint,
+    EvidencePrimitive,
+    Observation,
+    Relation,
+    Transition,
+    export_evidence,
+    verify_export,
+)
 from continuum.models import ConstraintPinned, Run
 from continuum.security.hashing import stable_hash
 from continuum.storage import SQLiteStorage
@@ -44,17 +55,17 @@ def test_every_event_exported_with_correct_hash_and_chain() -> None:
         # First primitives should correspond to events in order
         for i, ev in enumerate(events):
             prim = primitives[i]
-            assert prim["sequence"] == i + 1
-            assert prim["content_hash"] == ev.hash
-            assert prim["prev_hash"] == ev.prev_hash
-            assert prim["origin"] == ev.source.value
-            assert prim["event_id"] == ev.event_id
-            assert prim["event_type"] == ev.type.value
+            assert prim.sequence == i + 1
+            assert prim.content_hash == ev.hash
+            assert prim.prev_hash == ev.prev_hash
+            assert prim.origin == ev.source.value
+            assert prim.event_id == ev.event_id
+            assert prim.event_type == ev.type.value
             # Signature inputs must recompute to the stored hash
-            assert stable_hash(prim["signature_inputs"]) == ev.hash
+            assert stable_hash(prim.signature_inputs) == ev.hash
         # Chain links are contiguous
         for prev, cur in zip(primitives, primitives[1:], strict=False):
-            assert cur["prev_hash"] == prev["content_hash"]
+            assert cur.prev_hash == prev.content_hash
         # Full chain verifies via helper
         assert verify_export(primitives) is True
 
@@ -64,17 +75,16 @@ def test_provenance_survives_on_every_primitive() -> None:
         _make_run(store)
         primitives = export_evidence(store, "run_1")
         for prim in primitives:
-            assert "origin" in prim
-            assert prim["origin"] in (
+            assert prim.origin in (
                 "deterministic",
                 "human",
                 "external_agent",
                 "llm",
                 "imported",
             )
-            assert "payload" in prim
-            assert "signature_inputs" in prim
-            assert "content_hash" in prim
+            assert isinstance(prim.payload, dict)
+            assert isinstance(prim.signature_inputs, dict)
+            assert isinstance(prim.content_hash, str)
 
 
 def test_truncation_is_detectable() -> None:
@@ -90,13 +100,13 @@ def test_truncation_is_detectable() -> None:
         # expected count/final hash from verify() and will see a mismatch).
         tail_truncated = primitives[:-1]
         assert len(tail_truncated) != len(primitives)
-        assert tail_truncated[-1]["content_hash"] != primitives[-1]["content_hash"]
+        assert tail_truncated[-1].content_hash != primitives[-1].content_hash
         # The truncated prefix itself is still internally consistent when
         # checked in isolation (as any prefix of a valid chain is), but its
         # final hash does not match the full chain's head, which is how the
         # receiver detects truncation against the store's head hash.
         # Tamper a payload
-        tampered = [dict(p) for p in primitives]
+        tampered = [p.model_dump(mode="json") for p in primitives]
         tampered[1]["payload"] = {"tampered": True}
         # Recompute would fail because content_hash no longer matches signature
         # but our verify checks content_hash vs stable_hash(signature_inputs);
@@ -117,7 +127,7 @@ def test_four_primitive_kinds_present() -> None:
             ConstraintPinned(constraint_id="c1", sha256=_digest("hello")).model_dump(),
         )
         primitives = export_evidence(store, "run_1")
-        kinds = {p["kind"] for p in primitives}
+        kinds = {p.kind for p in primitives}
         # At minimum we have transitions and at least one of each other kind
         # due to our classification covering all event types
         assert "transition" in kinds
@@ -125,11 +135,11 @@ def test_four_primitive_kinds_present() -> None:
         # Observations come from TOOL/EVIDENCE etc., relations from dependency
         # Check that each kind carries its required fields
         for p in primitives:
-            assert p["kind"] in ("transition", "observation", "relation", "checkpoint")
-            if p["kind"] == "checkpoint":
-                assert "checkpoint_id" in p
-            elif p["kind"] == "relation":
-                assert "source_id" in p
+            assert p.kind in ("transition", "observation", "relation", "checkpoint")
+            if p.kind == "checkpoint":
+                assert hasattr(p, "checkpoint_id")
+            elif p.kind == "relation":
+                assert hasattr(p, "source_id")
 
 
 def test_checkpoint_primitive_carries_integrity_hash() -> None:
@@ -140,11 +150,14 @@ def test_checkpoint_primitive_carries_integrity_hash() -> None:
 
         CheckpointManager(store).checkpoint("run_1")
         primitives = export_evidence(store, "run_1")
-        cps = [p for p in primitives if p["kind"] == "checkpoint"]
+        cps = [p for p in primitives if p.kind == "checkpoint"]
         assert len(cps) >= 1
         for cp in cps:
-            assert "integrity_hash" in cp
-            assert "checkpoint_id" in cp
+            assert hasattr(cp, "integrity_hash")
+            assert hasattr(cp, "checkpoint_id")
+        # A checkpoint with a matching stored record carries its sealed hash.
+        sealed = next((cp for cp in cps if cp.integrity_hash is not None), None)
+        assert sealed is not None
 
 
 def test_export_covers_archived_events_after_compaction() -> None:
@@ -166,8 +179,8 @@ def test_export_covers_archived_events_after_compaction() -> None:
         # At least the original events are still present
         assert len(after) >= count_before - 1  # allow for anchor bookkeeping
         # Every hash from before that was an event should still appear
-        before_hashes = {p["content_hash"] for p in before}
-        after_hashes = {p["content_hash"] for p in after}
+        before_hashes = {p.content_hash for p in before}
+        after_hashes = {p.content_hash for p in after}
         # The archived event hashes must survive
         assert before_hashes.intersection(after_hashes)
 
@@ -208,6 +221,93 @@ def test_cli_unknown_run_exits_not_found(tmp_path) -> None:
         store.create_run(Run(run_id="exists", goal="g"))
     code, out, err = _run(db, "export-evidence", "ghost")
     assert code == ExitCode.NOT_FOUND
+
+
+def test_export_returns_the_declared_primitive_types() -> None:
+    # The four exported models are the module's own type system: the exporter
+    # must build them rather than hand-rolled dicts (issue #1155).
+    with SQLiteStorage(":memory:") as store:
+        _make_run(store)
+        primitives = export_evidence(store, "run_1")
+        assert all(isinstance(p, EvidencePrimitive) for p in primitives)
+        by_kind: dict[str, type] = {}
+        for p in primitives:
+            by_kind.setdefault(p.kind, type(p))
+        # _make_run yields transitions, relations and a checkpoint; each kind
+        # is built by its own subclass.
+        assert by_kind == {
+            "transition": Transition,
+            "relation": Relation,
+            "checkpoint": Checkpoint,
+        }
+
+
+def test_primitives_round_trip_through_their_models() -> None:
+    # A receiver rebuilds the same typed primitive from an exported line.
+    kind_models = {
+        "transition": Transition,
+        "observation": Observation,
+        "relation": Relation,
+        "checkpoint": Checkpoint,
+    }
+    with SQLiteStorage(":memory:") as store:
+        _make_run(store)
+        primitives = export_evidence(store, "run_1")
+        for p in primitives:
+            line = p.model_dump(mode="json")
+            rebuilt = kind_models[p.kind](**line)
+            assert rebuilt == p
+
+
+def test_models_reject_drifted_fields() -> None:
+    # extra="forbid": a stray key or a missing declared field is an error
+    # instead of silent dict-key drift.
+    with SQLiteStorage(":memory:") as store:
+        _make_run(store)
+        transition = next(p for p in export_evidence(store, "run_1") if p.kind == "transition")
+        line = transition.model_dump(mode="json")
+        with pytest.raises(ValidationError):
+            Transition(**line, not_a_declared_field="x")
+        trimmed = dict(line)
+        del trimmed["event_id"]
+        with pytest.raises(ValidationError):
+            Transition(**trimmed)
+
+
+def test_relation_endpoints_derived_and_preserved() -> None:
+    # The source/target guess lives in the model, so a relation rebuilt from
+    # an exported line yields the same endpoints the exporter produced.
+    with SQLiteStorage(":memory:") as store:
+        _make_run(store)
+        relation = next(p for p in export_evidence(store, "run_1") if p.kind == "relation")
+        assert relation.source_id == "r1"  # from DEPENDENCY_DECLARED resource
+        rebuilt = Relation(**relation.model_dump(mode="json"))
+        assert rebuilt.source_id == relation.source_id
+        assert rebuilt.target_id == relation.target_id
+
+
+def test_digest_covers_canonical_content() -> None:
+    # content()/digest() are reachable chain-verification primitives.
+    with SQLiteStorage(":memory:") as store:
+        _make_run(store)
+        primitive = export_evidence(store, "run_1")[0]
+        assert "content_hash" not in primitive.content()
+        assert primitive.digest() == stable_hash(primitive.content())
+
+
+def test_verify_export_rejects_drifted_lines() -> None:
+    # Dict input (a parsed JSON line) is rebuilt through its model, so a line
+    # that no longer matches the declared shape fails verification.
+    with SQLiteStorage(":memory:") as store:
+        _make_run(store)
+        lines = [p.model_dump(mode="json") for p in export_evidence(store, "run_1")]
+        assert verify_export(lines) is True
+        stray = [dict(p) for p in lines]
+        stray[0]["not_a_declared_field"] = "x"
+        assert verify_export(stray) is False
+        missing = [dict(p) for p in lines]
+        del missing[0]["event_id"]
+        assert verify_export(missing) is False
 
 
 def test_zero_new_dependencies() -> None:

@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The evidence export now returns the four primitive models it always declared (#1155).**
+  `export_evidence` in `src/continuum/interchange/evidence.py` built plain
+  `dict[str, Any]` values by hand while `Transition`, `Observation`, `Relation`
+  and `Checkpoint` sat unused in `__all__`, so a field could be renamed or
+  dropped from a subclass and nothing would break -- the dict keys were spelled
+  separately in the function body. The exporter now constructs the matching
+  subclass per event and returns `list[EvidencePrimitive]`, which puts
+  pydantic's `extra="forbid"` on the export path: a missing or stray field is
+  an immediate error rather than silent drift onto the wire. The relation
+  source/target extraction moved into a `Relation` model validator, so a
+  receiver rebuilding a primitive from an exported line derives the same
+  endpoints the exporter produced. `verify_export` takes the typed result or
+  the dicts a parsed JSON line yields, rebuilding dict input through its model
+  first, so a drifted line fails verification. The emitted JSON shape is
+  unchanged, and the dashboard examples in
+  `docs/guides/bring-your-own-dashboard.md` already read `p.kind` and call
+  `p.model_dump(mode="json")`, which the dict-era exporter did not actually
+  support.
+
 - **The advisory verdict contract is now stated where a reader can find it (#1031).**
   `RecoveryDecision` and its `permits()` method describe themselves as
   advisory, not enforcing, and name the four enforcement seams a caller can
