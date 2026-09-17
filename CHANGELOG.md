@@ -77,6 +77,39 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Oversized event payloads are offloaded to a content-addressed blob store
+  (#254).** Event payloads above a configurable threshold (gateway evidence
+  bodies, reasoning summaries, OTel attribute bundles) would otherwise bloat
+  both the live log and the archive, and every replay pays to re-read them.
+  Following the payload-codec pattern durable-execution platforms use
+  (Temporal's large-payload codec is the reference), the SQLite engine now
+  writes oversized payloads to `<database>.blobs/<sha256>` and keeps only a
+  reference inline:
+  `{"__offloaded": <sha256>, "keys": [...], "bytes": <n>}`.
+
+  The digest still covers the *recorded* payload, so the hash chain,
+  `verify`, import/export, forking, the action index and state projection all
+  behave exactly as if the payload had been stored inline; no caller has to
+  know offloading is in play. Reading is fail-closed: a missing or altered
+  blob raises `CorruptedRecord` naming the digest rather than handing back
+  state that cannot be shown to be the recorded state, and `continuum verify
+  --deep` walks the blob store explicitly, reporting each bad blob and how
+  many it examined. Blobs are content-addressed and immutable, so compaction
+  (#239) moves nothing: the reference travels verbatim into `events_archive`
+  and rehydrates from either table. Blob lifetime stays operator-owned.
+
+  Opt-in and off by default: set `CONTINUUM_PAYLOAD_OFFLOAD_BYTES` or pass
+  `payload_offload_bytes=` to `SQLiteStorage`. An in-memory database has no
+  directory to sit beside and gets scratch space instead of silently storing
+  every payload inline. `PostgresStorage` keeps payloads inline in a `JSONB`
+  column and now *refuses* the configuration rather than accepting and
+  ignoring it, since that would look like a configured offload that never
+  happens. Not a breaking change: with the threshold unset, behaviour is
+  byte-for-byte the previous one. `tests/test_blob_offload.py` pins the
+  round trip, dedup, fail-closed reads, deep audit, compaction survival,
+  index and projection behaviour. (~2,275 collected, ~2,237 passed,
+  ~38 skipped on a minimal env.)
+
 - **Curated briefing by provenance (#742).** `continuum briefing` no longer
   rehydrates the newest agent-authored reasoning summary verbatim. A pure,
   deterministic curation layer (`continuum.recovery.briefing_curation`) builds
@@ -845,7 +878,7 @@ All notable changes to this project are documented here. The format follows
   Framework Integration documents the CrewAI/AutoGen/Pydantic-AI thin hooks
   and the gateway/OTel fallback seams; the Roadmap marks the dashboard and
   the enforced-durability work complete; test counts are current
-  (~2,241 collected, ~2,216 passed, ~25 skipped on a minimal env).
+  (~2,275 collected, ~2,237 passed, ~38 skipped on a minimal env).
   <!-- generated via: pytest --collect-only -q; pytest -q -->
 
 - **Gateway hardening and docs refresh.** The enforcing proxy now refuses
