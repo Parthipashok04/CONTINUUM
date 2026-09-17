@@ -284,6 +284,14 @@ class IntegrityReport(BaseModel):
     violations: list[IntegrityViolation] = Field(default_factory=list)
     trusted_through: dict[str, int] = Field(default_factory=dict)
     truncated: bool = False
+    blobs_checked: int = 0
+    """Out-of-band payload blobs examined (issue #254).
+
+    Nonzero only for a deep audit on an engine that offloads payloads. A
+    shallow audit rehydrates what it reads anyway, so a missing or altered blob
+    surfaces as a violation either way; this counter is how a deep report says
+    the blob store was actually walked rather than skipped.
+    """
 
 
 class EventLog:

@@ -181,7 +181,24 @@ class PostgresStorage(Storage):
     supports_action_index = True
     supports_compaction = True
 
-    def __init__(self, url: str | Any, *, timeout: float = 30.0) -> None:
+    #: Payload offloading is a SQLite-engine capability (issue #254). Postgres
+    #: keeps payloads inline in a ``JSONB`` column, which has no equivalent size
+    #: cliff, so the flag stays False and ``--deep`` reports nothing offloaded.
+    supports_blob_offload = False
+
+    def __init__(
+        self, url: str | Any, *, timeout: float = 30.0, payload_offload_bytes: int | None = None
+    ) -> None:
+        if (0 if payload_offload_bytes is None else max(0, payload_offload_bytes)) > 0:
+            # Refused loudly rather than accepted and ignored: an operator who
+            # sets CONTINUUM_PAYLOAD_OFFLOAD_BYTES against a Postgres store has
+            # a size problem this engine does not solve for them, and silence
+            # would look like a configured offload that never happens.
+            raise ValueError(
+                "PostgresStorage stores event payloads inline and does not support "
+                "payload offloading; use SQLiteStorage, or keep payloads small enough "
+                "for a JSONB column"
+            )
         psycopg = _require_psycopg()
         self._psycopg = psycopg
         from psycopg.rows import dict_row
@@ -786,7 +803,7 @@ class PostgresStorage(Storage):
                 f"failed to load: {exc}"
             ) from exc
 
-    def verify_events(self, run_id: str) -> IntegrityReport:
+    def verify_events(self, run_id: str, *, deep: bool = False) -> IntegrityReport:
         """Re-audit a persisted chain without loading it into an EventLog.
 
         For a compacted run (#239) the walk resumes at the archive boundary:
@@ -796,7 +813,13 @@ class PostgresStorage(Storage):
         only while its archived prefix is intact; removing the boundary
         events or editing history in the archive fails here instead of
         minting a fresh genesis out of whatever live rows survive.
+
+        ``deep`` is accepted for interface parity and ignored: this engine
+        stores payloads inline (``supports_blob_offload`` is False), so there
+        is no out-of-band blob store to walk. A shallow audit already covers
+        every byte the engine is responsible for.
         """
+        del deep
         violations: list[IntegrityViolation] = []
         checked = 0
         last_good = 0

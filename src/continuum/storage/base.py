@@ -112,6 +112,13 @@ class Storage(ABC):
     #: catching NotImplementedError, mirroring :attr:`supports_action_index`.
     supports_compaction: ClassVar[bool] = False
 
+    #: True when the engine moves oversized event payloads out of the row and
+    #: into a content-addressed blob store (issue #254). Callers gate on this
+    #: flag rather than probing for a blob directory: engines that keep payloads
+    #: inline have no blobs to audit, and an engine that silently accepted the
+    #: threshold while ignoring it would look configured but never offload.
+    supports_blob_offload: ClassVar[bool] = False
+
     def compact_run(self, run_id: str, *, through_sequence: int | None = None) -> dict[str, int]:
         """Archive the pre-anchor prefix of a run's log (issue #239).
 
@@ -305,8 +312,16 @@ class Storage(ABC):
         ...
 
     @abstractmethod
-    def verify_events(self, run_id: str) -> IntegrityReport:
-        """Recompute the hash chain and report whether it is intact."""
+    def verify_events(self, run_id: str, *, deep: bool = False) -> IntegrityReport:
+        """Recompute the hash chain and report whether it is intact.
+
+        ``deep`` additionally walks the blob store on engines that offload
+        oversized payloads (issue #254), reporting each missing or altered blob
+        as its own violation naming the digest. A missing blob is never silent
+        at any depth, because reading an event rehydrates it or refuses; ``deep``
+        is what makes the audit say how many blobs were examined. Engines that
+        store payloads inline accept and ignore the flag.
+        """
         ...
 
     # -- state versions --------------------------------------------------- #
