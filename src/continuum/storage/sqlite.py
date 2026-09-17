@@ -43,6 +43,7 @@ from continuum.storage.base import (
     RunNotFound,
     Storage,
 )
+from continuum.storage.blobs import FileBlobStore, is_offload_marker, offload_threshold
 from continuum.storage.migrations import SCHEMA_VERSION, migrate_schema
 
 __all__ = ["SQLiteStorage", "SCHEMA_VERSION"]
@@ -96,14 +97,31 @@ class SQLiteStorage(Storage):
 
     supports_action_index = True
     supports_compaction = True
+    supports_blob_offload = True
 
-    def __init__(self, url: str | Path = ":memory:", *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        url: str | Path = ":memory:",
+        *,
+        timeout: float = 30.0,
+        payload_offload_bytes: int | None = None,
+    ) -> None:
+        """Open the database, optionally offloading oversized payloads.
+
+        ``payload_offload_bytes`` sets the threshold above which an event's
+        payload is stored in ``<database>.blobs/<sha256>`` instead of the row
+        (issue #254). ``None`` resolves ``CONTINUUM_PAYLOAD_OFFLOAD_BYTES``, and
+        either form as 0 (the default) stores every payload inline.
+        """
         self.path = _resolve_path(url)
         if self.path != ":memory:":
             raw = str(url)
             if raw.startswith("sqlite://"):
                 with suppress(OSError):
                     Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._blobs = FileBlobStore.for_database(
+            self.path, offload_threshold(payload_offload_bytes)
+        )
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(
             self.path,
@@ -172,10 +190,17 @@ class SQLiteStorage(Storage):
             yield self._live_connection()
 
     def close(self) -> None:
-        """Close the connection. Idempotent; later use raises a clear error."""
+        """Close the connection and any blob scratch space. Idempotent."""
         with self._lock:
+            blobs = getattr(self, "_blobs", None)
             conn = getattr(self, "_connection", None)
             if conn is None:
+                # Still drop scratch space if a caller never offloaded through
+                # the connection: close must not leave temp dirs behind just
+                # because the database was never used.
+                if blobs is not None:
+                    with suppress(Exception):
+                        blobs.close()
                 return
             try:
                 conn.close()
@@ -184,9 +209,12 @@ class SQLiteStorage(Storage):
                 pass
             finally:
                 self._connection = None  # type: ignore[assignment]
+                if blobs is not None:
+                    with suppress(Exception):
+                        blobs.close()
 
     def __del__(self) -> None:
-        """Release the connection if the owner never closed it.
+        """Release the connection and blob scratch space if the owner never closed it.
 
         A dropped handle should not leak an OS file descriptor. This is a
         safety net, not a substitute for ``close()`` or a ``with`` block:
@@ -197,6 +225,10 @@ class SQLiteStorage(Storage):
         if connection is not None:
             with suppress(Exception):  # interpreter teardown can be hostile
                 connection.close()
+        blobs = getattr(self, "_blobs", None)
+        if blobs is not None:
+            with suppress(Exception):
+                blobs.close()
 
     # -- runs ------------------------------------------------------------- #
 
@@ -252,7 +284,7 @@ class SQLiteStorage(Storage):
                 source=source,
                 prev_hash=None,
             ).sealed()
-            self._insert_event(conn, event)
+            self._insert_event(conn, event, self._offload_marker(event))
         return run
 
     def get_run(self, run_id: str) -> Run:
@@ -406,7 +438,7 @@ class SQLiteStorage(Storage):
             source=source,
             prev_hash=head["hash"] if head else None,
         ).sealed()
-        self._insert_event(conn, event)
+        self._insert_event(conn, event, self._offload_marker(event))
         return event
 
     def append_sealed(self, event: Event) -> Event:
@@ -454,11 +486,23 @@ class SQLiteStorage(Storage):
                 raise CorruptedRecord(
                     f"run {event.run_id!r} seq {event.sequence}: hash does not match content"
                 )
-            self._insert_event(conn, event)
+            self._insert_event(conn, event, self._offload_marker(event))
         return event
 
+    def _offload_marker(self, event: Event) -> Mapping[str, Any] | None:
+        """Move an oversized payload out of the row, if the threshold says to.
+
+        Returns the reference that belongs in the ``payload`` column, or ``None``
+        when the payload stays inline. The event itself keeps its real payload:
+        the digest must cover the recorded content, and only the stored column
+        holds the reference (issue #254).
+        """
+        return self._blobs.maybe_offload(event.payload)
+
     @staticmethod
-    def _insert_event(conn: sqlite3.Connection, event: Event) -> None:
+    def _insert_event(
+        conn: sqlite3.Connection, event: Event, stored_payload: Mapping[str, Any] | None = None
+    ) -> None:
         try:
             cursor = conn.execute(
                 "INSERT INTO events(run_id, sequence, event_id, type, timestamp, payload, "
@@ -470,7 +514,10 @@ class SQLiteStorage(Storage):
                     event.event_id,
                     event.type.value,
                     event.timestamp.isoformat(),
-                    json.dumps(dict(event.payload), sort_keys=True),
+                    json.dumps(
+                        dict(stored_payload if stored_payload is not None else event.payload),
+                        sort_keys=True,
+                    ),
                     event.causer_event_id,
                     event.source.value,
                     event.prev_hash,
@@ -500,6 +547,12 @@ class SQLiteStorage(Storage):
         rejected (issue #705) instead of silently deleting the anchor and
         every live row, which would leave the next append minting a fresh
         genesis and fork the hash chain away from the archive.
+
+        Offloaded payloads (issue #254) move for free: a blob is content-addressed
+        and immutable, so the reference travels verbatim into ``events_archive``
+        with its row and rehydrates from either table. Blob lifetime stays
+        operator-owned, because the same payload may still be referenced from a
+        run worth inspecting.
         """
         from continuum.checkpoint.manager import CheckpointManager
 
@@ -661,8 +714,11 @@ class SQLiteStorage(Storage):
         offset = len(archived)
         for position, row in enumerate([*archived, *rows]):
             try:
-                payload = json.loads(row["payload"])
-            except json.JSONDecodeError:
+                payload = self._blobs.rehydrate(json.loads(row["payload"]))
+            except (json.JSONDecodeError, CorruptedRecord):
+                # An unreadable row cannot contribute a canonical entry, so it
+                # is skipped: repair then reports it as drift rather than
+                # crashing an operator out of a fixable database.
                 continue
             entry = index_entry_from_payload(EventType(row["type"]), payload)
             if entry is not None:
@@ -702,16 +758,21 @@ class SQLiteStorage(Storage):
             ).fetchone()
         return int(row["seq"]) if row and row["seq"] is not None else 0
 
-    @staticmethod
-    def _row_to_event(row: sqlite3.Row) -> Event:
+    def _row_to_event(self, row: sqlite3.Row) -> Event:
+        """Rebuild an event from a row, rehydrating an offloaded payload.
+
+        A row whose payload was offloaded (issue #254) holds only a reference;
+        the recorded payload comes back from the blob store, digest-verified.
+        """
         try:
+            payload = self._blobs.rehydrate(json.loads(row["payload"]))
             return Event(
                 event_id=row["event_id"],
                 run_id=row["run_id"],
                 sequence=row["sequence"],
                 type=row["type"],
                 timestamp=row["timestamp"],
-                payload=json.loads(row["payload"]),
+                payload=payload,
                 causer_event_id=row["causer_event_id"],
                 source=row["source"],
                 prev_hash=row["prev_hash"],
@@ -723,7 +784,7 @@ class SQLiteStorage(Storage):
                 f"failed to load: {exc}"
             ) from exc
 
-    def verify_events(self, run_id: str) -> IntegrityReport:
+    def verify_events(self, run_id: str, *, deep: bool = False) -> IntegrityReport:
         """Re-audit a persisted chain without loading it into an EventLog.
 
         For a compacted run (#239) the walk resumes at the archive boundary:
@@ -736,6 +797,7 @@ class SQLiteStorage(Storage):
         """
         violations: list[IntegrityViolation] = []
         checked = 0
+        blobs_checked = 0
         last_good = 0
         intact = True
         prev_digest: str | None = None
@@ -756,9 +818,19 @@ class SQLiteStorage(Storage):
                 is not None
             )
             if has_archive or any(r["type"] == "EVENT_LOG_ANCHORED" for r in rows):
-                archive_violations, archive_edge = self._audit_archive(conn, run_id)
+                archive_violations, archive_edge, archived_blobs = self._audit_archive(
+                    conn, run_id, deep=deep
+                )
                 violations.extend(archive_violations)
+                blobs_checked += archived_blobs
                 if archive_violations:
+                    intact = False
+
+            if deep:
+                live_blobs, blob_violations = self._audit_blobs(conn, run_id)
+                blobs_checked += live_blobs
+                violations.extend(blob_violations)
+                if blob_violations:
                     intact = False
 
         if archive_edge is not None:
@@ -836,20 +908,65 @@ class SQLiteStorage(Storage):
             checked=checked,
             violations=violations,
             trusted_through={run_id: last_good},
+            blobs_checked=blobs_checked,
         )
 
-    @classmethod
+    def _audit_blobs(
+        self, conn: sqlite3.Connection, run_id: str, *, archived: bool = False
+    ) -> tuple[int, list[IntegrityViolation]]:
+        """Walk the offloaded payload references in one table of a run (issue #254).
+
+        Every reference is audited whether or not its row is otherwise healthy:
+        a blob that has gone missing or been altered is reported by digest so an
+        operator can find the file, and the count is what makes the report say
+        the blob store was actually walked rather than assumed fine. Engines
+        that store payloads inline have no references, so this is a no-op that
+        still reports zero work rather than silently skipping.
+        """
+        query = (
+            "SELECT sequence, event_id, payload FROM events_archive "
+            "WHERE run_id = ? ORDER BY sequence ASC"
+            if archived
+            else "SELECT sequence, event_id, payload FROM events "
+            "WHERE run_id = ? ORDER BY sequence ASC"
+        )
+        violations: list[IntegrityViolation] = []
+        checked = 0
+        rows = conn.execute(query, (run_id,)).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except json.JSONDecodeError:
+                continue
+            if not is_offload_marker(payload):
+                continue
+            checked += 1
+            ok, detail = self._blobs.audit(payload)
+            if ok:
+                continue
+            violations.append(
+                IntegrityViolation(
+                    kind="BLOB_UNAVAILABLE",
+                    run_id=run_id,
+                    sequence=row["sequence"],
+                    event_id=row["event_id"],
+                    detail=detail,
+                )
+            )
+        return checked, violations
+
     def _audit_archive(
-        cls, conn: sqlite3.Connection, run_id: str
-    ) -> tuple[list[IntegrityViolation], tuple[int, str] | None]:
+        self, conn: sqlite3.Connection, run_id: str, *, deep: bool = False
+    ) -> tuple[list[IntegrityViolation], tuple[int, str] | None, int]:
         """Deep-audit one run's archived prefix (issue #239).
 
         The archive holds the run's verbatim beginning, so it can be held to
         the full genesis standard: sequence 1 with no predecessor, unbroken
         sequencing and hash linkage throughout, and every stored hash equal
-        to the recomputed digest. Returns the violations found plus the
-        ``(sequence, hash)`` edge the live chain must continue from, or
-        ``None`` when nothing is archived.
+        to the recomputed digest. Returns the violations found, the
+        ``(sequence, hash)`` edge the live chain must continue from (``None``
+        when nothing is archived), and how many offloaded payload blobs were
+        examined when ``deep`` walked the archive.
         """
         violations: list[IntegrityViolation] = []
         edge: tuple[int, str] | None = None
@@ -861,7 +978,7 @@ class SQLiteStorage(Storage):
         ).fetchall()
         for row in rows:
             try:
-                event = cls._row_to_event(row)
+                event = self._row_to_event(row)
             except CorruptedRecord as exc:
                 violations.append(
                     IntegrityViolation(
@@ -914,7 +1031,12 @@ class SQLiteStorage(Storage):
             expected_sequence = event.sequence + 1
             edge = (event.sequence, event.hash) if event.hash is not None else None
 
-        return violations, edge
+        blobs_checked = 0
+        if deep:
+            blobs_checked, blob_violations = self._audit_blobs(conn, run_id, archived=True)
+            violations.extend(blob_violations)
+
+        return violations, edge, blobs_checked
 
     # -- versions --------------------------------------------------------- #
 

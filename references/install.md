@@ -60,6 +60,46 @@ Combine freely: `[dev]` already includes `mcp`, `langgraph`, `langchain`, `opena
 
 No other runtime dependencies. The CLI, storage, recovery engine, and checkpointing use only the Python standard library.
 
+## Payload offloading (optional, SQLite)
+
+Event payloads above a size threshold would otherwise bloat both the live log
+and the archive, and every replay pays to re-read them. The SQLite engine can
+move them out of the row into a content-addressed blob store instead, keeping
+only a reference inline (`{"__offloaded": <sha256>, "keys": [...], "bytes":
+<n>}`):
+
+```bash
+# Bytes of canonical JSON above which a payload leaves the row. 0 = inline (default).
+export CONTINUUM_PAYLOAD_OFFLOAD_BYTES=8192
+continuum --db /var/lib/continuum/continuum.db resume "$RUN_ID"
+```
+
+The directory is `<database>.blobs/` alongside the database, each blob named by
+its SHA-256. The event's hash still covers the recorded payload, so the chain,
+`verify`, import/export, forking and state projection behave exactly as if the
+payload had been stored inline: a caller never has to know offloading is in
+play. Reading is fail-closed: a missing or altered blob raises
+`CorruptedRecord` naming the digest rather than returning state that cannot be
+shown to be the recorded state. `continuum verify --deep` walks the blob store
+explicitly and reports how many blobs it examined. Blobs are content-addressed
+and immutable, so compaction moves nothing (the reference travels verbatim into
+`events_archive`), and blob deletion stays operator-owned, since the same
+payload may still be referenced from a run worth inspecting.
+
+Notes:
+
+- **An unparseable value is an error, not a silent disable.** A typo'd
+  `CONTINUUM_PAYLOAD_OFFLOAD_BYTES=1MB` fails loudly rather than quietly
+  turning off a durability feature the operator believes is on.
+- **An in-memory database** (`:memory:`) has no directory to sit beside, so it
+  gets scratch space created on first use and removed on close. Without that
+  fallback, enabling offloading on an in-memory store would silently store
+  every payload inline.
+- **PostgreSQL keeps payloads inline** in a `JSONB` column, which has no
+  equivalent size cliff, and *refuses* the setting rather than accepting and
+  ignoring it. `continuum verify --deep` reports `[auto] this engine stores
+  payloads inline` on that engine.
+
 ## Postgres contract tests (optional)
 
 The PostgreSQL backend is covered by the `[postgres]` extra and is exercised in CI via `CONTINUUM_TEST_POSTGRES_DSN`, but core development does not need it. The SQLite WAL store is the default and stays dependency-free.
@@ -97,7 +137,7 @@ continuum-mcp --help             # needs [mcp] or [dev]
 # powershell -ExecutionPolicy Bypass -File .\try-it.ps1
 # powershell -ExecutionPolicy Bypass -File .\try-it.ps1 cli --help
 
-# Full test suite (~2,241 tests; exact skips vary by environment)
+# Full test suite (~2,275 tests; exact skips vary by environment)
 pytest -q                        # or: ./try-it.sh test
 pytest --no-cov --tb=short -q    # faster, no coverage
 pytest tests/test_events.py -v   # single file
