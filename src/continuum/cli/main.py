@@ -3065,7 +3065,8 @@ def cmd_verify(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
         return ExitCode.ERROR
 
     storage.get_run(args.run_id)
-    report = storage.verify_events(args.run_id)
+    deep = getattr(args, "deep", False)
+    report = storage.verify_events(args.run_id, deep=deep)
     payload = report.model_dump(mode="json")
     if report.ok:
         text = f"Event chain verified: {report.checked} events, no violations."
@@ -3079,6 +3080,28 @@ def cmd_verify(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
         trusted = report.trusted_through.get(args.run_id, 0)
         lines.append(f"  trusted through sequence {trusted}")
         text = "\n".join(lines)
+
+    # Out-of-band payload blobs (issue #254). A shallow audit rehydrates what it
+    # reads, so a missing or altered blob already fails above as
+    # UNREADABLE_RECORD; --deep is what makes the report say the blob store was
+    # walked end to end instead of only checked where the chain touched it.
+    # Engines that keep payloads inline have no blobs, which is reported as an
+    # automatic pass rather than silence.
+    blob_lines: list[str] = []
+    if deep:
+        if storage.supports_blob_offload:
+            blob_lines.append(
+                f"[ok] {report.blobs_checked} offloaded payload blob(s) verified"
+                if report.blobs_checked
+                else "[ok] no offloaded payload blobs (threshold never exceeded)"
+            )
+        else:
+            blob_lines.append("[auto] this engine stores payloads inline")
+        text = text + "\n" + "\n".join(blob_lines)
+        payload["blob_audit"] = {
+            "supported": storage.supports_blob_offload,
+            "checked": report.blobs_checked,
+        }
 
     # Action index consistency (issue #216). The index is a projection of the
     # ACTION_* events, so any disagreement is drift in the projection, never
@@ -4146,6 +4169,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--repair-index",
         action="store_true",
         help="rebuild drifted index rows from the log (requires --index).",
+    )
+    verify.add_argument(
+        "--deep",
+        action="store_true",
+        help="also walk out-of-band payload blobs (issue #254), not just the rows.",
     )
 
     forget = add(
