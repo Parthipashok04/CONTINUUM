@@ -537,6 +537,107 @@ def test_confirmation_survives_compaction(store: SQLiteStorage) -> None:
     assert after.safe
 
 
+def _assert_archived(store: SQLiteStorage, run_id: str, kind: EventType) -> None:
+    """A compaction test that archives nothing proves nothing: pin that the
+    event really left the live tail and reached the archive."""
+    live = [e.type for e in store.read_events(run_id)]
+    archived = [e.type for e in store.read_all_events(run_id)]
+    assert kind not in live, f"precondition failed: {kind.value} still in the live tail"
+    assert kind in archived, f"precondition failed: {kind.value} never reached the archive"
+
+
+def test_liveness_breach_count_survives_compaction(store: SQLiteStorage) -> None:
+    """A silence detected before the anchor must still count afterwards.
+
+    The breach count is the record that this run went quiet once. Reading only
+    the live tail resets it to zero over a deliberately truncated history, and
+    a count of zero reads as "never went quiet" (issue #1050).
+    """
+    store.create_run(Run(run_id="r1", goal="do X"))
+    store.append_event("r1", EventType.RUN_STARTED, {"goal": "do X"}, source=Origin.EXTERNAL_AGENT)
+    store.append_event(
+        "r1", EventType.TASK_UPDATED, {"completed": 1, "failed": 0}, source=Origin.EXTERNAL_AGENT
+    )
+    store.append_event(
+        "r1",
+        EventType.LIVENESS_SILENCE_DETECTED,
+        {"silence_seconds": 4000, "threshold_seconds": 3600, "phase": "otherwise"},
+    )
+
+    before = RecoveryEngine(store).assess("r1")
+    assert before.contract.liveness is not None
+    assert before.contract.liveness["breaches"] == 1
+
+    store.compact_run("r1")
+    _assert_archived(store, "r1", EventType.LIVENESS_SILENCE_DETECTED)
+
+    after = RecoveryEngine(store).assess("r1")
+    assert after.contract.liveness is not None
+    assert after.contract.liveness["breaches"] == 1, "compaction erased the breach count"
+
+
+def test_triggering_risks_survive_compaction(store: SQLiteStorage) -> None:
+    """A RISK_OBSERVED before the anchor must still trigger its mode.
+
+    The sealed contract keeps carrying the trigger ids, so the verdict stays as
+    cautious as the run's history actually warrants instead of emptying the
+    trigger list the moment compaction seals the only RISK_OBSERVED away
+    (issue #1050).
+    """
+    store.create_run(Run(run_id="r1", goal="do X"))
+    store.append_event("r1", EventType.RUN_STARTED, {"goal": "do X"}, source=Origin.EXTERNAL_AGENT)
+    store.append_event(
+        "r1", EventType.TASK_UPDATED, {"completed": 1, "failed": 0}, source=Origin.EXTERNAL_AGENT
+    )
+    store.append_event(
+        "r1",
+        EventType.RISK_OBSERVED,
+        {"trigger": "meltdown", "score": 0.9, "detail": "cascade"},
+        source=Origin.EXTERNAL_MONITOR,
+    )
+
+    before = RecoveryEngine(store).assess("r1")
+    assert before.contract.triggering_risks, "precondition failed: trigger never recorded"
+
+    store.compact_run("r1")
+    _assert_archived(store, "r1", EventType.RISK_OBSERVED)
+
+    after = RecoveryEngine(store).assess("r1")
+    assert after.contract.triggering_risks == before.contract.triggering_risks, (
+        "compaction emptied triggering_risks"
+    )
+
+
+def test_consumed_authority_survives_compaction(store: SQLiteStorage) -> None:
+    """An authority consumed before the anchor must still block resume.
+
+    The gate would still deny the forward, so the recovery contract must not
+    report safe over a history that lost the consumption. Dropping the
+    consumed authority is a downgrade toward less caution (issue #1050).
+    """
+    store.create_run(Run(run_id="r1", goal="do X"))
+    store.append_event("r1", EventType.RUN_STARTED, {"goal": "do X"}, source=Origin.EXTERNAL_AGENT)
+    store.append_event(
+        "r1", EventType.TASK_UPDATED, {"completed": 1, "failed": 0}, source=Origin.EXTERNAL_AGENT
+    )
+    store.append_event(
+        "r1",
+        EventType.AUTHORITY_CONSUMED,
+        {"authority_id": "auth-pre-anchor", "via_action_id": "act-1"},
+    )
+
+    before = RecoveryEngine(store).assess("r1")
+    assert before.mode is RecoveryMode.REQUEST_HUMAN
+    assert any("consumed authority blocks resume" in r for r in before.rationale)
+
+    store.compact_run("r1")
+    _assert_archived(store, "r1", EventType.AUTHORITY_CONSUMED)
+
+    after = RecoveryEngine(store).assess("r1")
+    assert after.mode is RecoveryMode.REQUEST_HUMAN, "compaction cleared the authority block"
+    assert any("consumed authority blocks resume" in r for r in after.rationale)
+
+
 def test_assess_degrades_when_the_archive_read_fails(store: SQLiteStorage) -> None:
     """A failing archive read must not fail assess(): the shared fetch falls
     back to the live log, so a broken archive view degrades to the live-only
