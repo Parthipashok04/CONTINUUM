@@ -33,6 +33,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **`assess` folds the archived prefix into its liveness, risk and
+  consumed-authority scans (#1050).** The confirmation scan and the state
+  validator already shared one archive-aware fetch of the run's events, but
+  three other signals in the same method re-read the live tail only: the
+  liveness breach count, the `RISK_OBSERVED` scan, and the consumed-authority
+  scan. `continuum compact` archives the pre-anchor prefix, so after a
+  compaction all three vanished from the sealed contract: `triggering_risks`
+  emptied, a recorded `LIVENESS_SILENCE_DETECTED` breach count fell to zero,
+  and a consumed authority awaiting an external probe dropped out of the
+  rationale. The engine still returned a verdict, just one computed over a
+  deliberately truncated history, and each of those downgrades was toward
+  less caution. All three scans now filter the existing archive-aware fetch,
+  which also removes three redundant live-tail reads per assessment. The
+  shared fetch already falls back to the live log when the archive cannot be
+  read, so the guard around it covers the fold itself rather than swallowing
+  a read failure.
+
 - **`load_reconcilers` now refuses a registry missing the `probes` wrapper
   instead of silently loading it as empty (#1062).** A file that maps action
   types at the top level (`{"send_invoice": {...}}`) instead of nesting them
