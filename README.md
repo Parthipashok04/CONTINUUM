@@ -238,7 +238,7 @@ CONTINUUM is verified against real LLM agents, live protocol boundaries, and har
 <!-- BENCH:START -->
 ### Horizon-scale benchmark (real runs, no invented numbers)
 
-Generated: 2026-10-09T11:42:35.458432  Horizon scenarios: 5  Passed: 4  Failed: 1
+Generated: 2026-10-10T11:00:48.726871  Horizon scenarios: 5  Passed: 4  Failed: 1
 
 Accuracy: 0.8  Unnecessary escalation: 0.2  Repair precision: 0.8  Duplicate side effects: 0  Duplicate work: 0.0  Compression: 0.138
 
